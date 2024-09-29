@@ -3,8 +3,10 @@ import os
 import time
 import logging
 import requests
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pytz import utc  # для работы с временными зонами
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -13,124 +15,96 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Глобальные переменные
-episode_tracker = {}
-chat_ids = []
+subscriptions = {}  # Структура вида: {"chat_id": {"anime_id": episodes_aired}}
 last_request_times = {}
 request_interval = 12 * 3600  # Интервал между запросами свежей подборки (12 часов)
-episode_tracker_file = "episode_tracker.json"
-chat_ids_file = "chat_ids.json"
 
+subscriptions_file = "subscriptions.json"
 API_TOKEN = '5160413773:AAGyjpQbrAL-1hR6bnV8GwDY3ioIjxBVRzk'  # Замените на ваш токен
 
 
 # Класс для хранения данных об аниме
 class Anime:
-    def __init__(self, id, name, russian, image, score, episodes, episodes_aired, url, status, **kwargs):
+    def __init__(self, id, name, russian, image, score, episodes, episodes_aired, **kwargs):
         self.id = id
         self.name = name
         self.title = russian  # Используем поле 'russian' для названия на русском
-        self.image = f"https://shikimori.one{image['original']}"  # Строим полный URL изображения
+        self.image = image
         self.score = score
         self.episodes_all = episodes  # Количество серий всего
-        self.episode = episodes_aired  # Количество вышедших серий
-        self.url = f"https://shikimori.one{url}"  # Строим полный URL страницы аниме
-        self.status = status  # Статус аниме (например, анонс)
+        self.episodes_aired = episodes_aired  # Количество вышедших серий
 
     def format_anime(self):
         title = self.title if self.title else self.name
         episodes_all = str(self.episodes_all) if self.episodes_all > 0 else "?"
-        return f"{title}\nРейтинг: {self.score} ⭐️\nСерии: {self.episode} из {episodes_all} 📺\nСсылка: {self.url}"
+        return f"{title}\nРейтинг: {self.score} ⭐️\nСерии: {self.episodes_aired} из {episodes_all} 📺\nСсылка: https://shikimori.one/animes/{self.id}"
 
 
-# Загрузка трекера эпизодов
-def load_episode_tracker():
-    global episode_tracker
-    if os.path.exists(episode_tracker_file):
-        try:
-            with open(episode_tracker_file, "r", encoding="utf-8") as file:
-                if os.stat(episode_tracker_file).st_size == 0:
-                    episode_tracker = {}
-                else:
-                    episode_tracker = json.load(file)
-        except json.JSONDecodeError:
-            logger.error("Ошибка: файл episode_tracker.json поврежден или пуст. Создан новый файл.")
-            episode_tracker = {}
+# Загрузка подписок
+def load_subscriptions():
+    global subscriptions
+    if os.path.exists(subscriptions_file):
+        with open(subscriptions_file, "r", encoding="utf-8") as file:
+            if os.stat(subscriptions_file).st_size == 0:
+                subscriptions = {}
+            else:
+                subscriptions = json.load(file)
     else:
-        logger.info("Файл episode_tracker.json не найден. Создан новый файл.")
-        episode_tracker = {}
+        subscriptions = {}
 
 
-# Загрузка chat_ids
-def load_chat_ids():
-    if os.path.exists(chat_ids_file):
-        with open(chat_ids_file, 'r') as file:
-            global chat_ids
-            chat_ids = json.load(file)
-
-
-# Сохранение трекера эпизодов
-def save_episode_tracker():
-    with open(episode_tracker_file, "w", encoding="utf-8") as file:
-        json.dump(episode_tracker, file, ensure_ascii=False, indent=4)
-
-
-# Сохранение chat_ids
-def save_chat_ids():
-    with open(chat_ids_file, 'w') as file:
-        json.dump(chat_ids, file)
+# Сохранение подписок
+def save_subscriptions():
+    with open(subscriptions_file, "w", encoding="utf-8") as file:
+        json.dump(subscriptions, file, ensure_ascii=False, indent=4)
 
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat.id
-    if chat_id not in chat_ids:
-        chat_ids.append(chat_id)
-        save_chat_ids()
 
-    keyboard = [['Свежая подборка']]  # Клавиатура с одной кнопкой
+    chat_id = str(update.message.chat.id)
+    if chat_id not in subscriptions:
+        subscriptions[chat_id] = {}
+        save_subscriptions()
+
     await update.message.reply_text(
-        "Привет! Я бот, который сообщает о новинках аниме и позволяет подписаться на уведомления о выходе новых серий 📺 ✨",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        "Привет! Я бот, который сообщает о новинках аниме и позволяет подписаться на уведомления о выходе новых серий 📺 ✨"
     )
 
 
 # Функция для получения свежих аниме
+# Функция для получения свежих аниме
 async def fresh_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat.id
+    chat_id = str(update.message.chat.id)
     current_time = time.time()
 
     # Проверка времени последнего запроса для предотвращения частого запроса
     if chat_id in last_request_times:
         if current_time - last_request_times[chat_id] < request_interval:
-            await update.message.reply_text("Вы можете запросить свежую подборку раз в 12 часов ⏰.\nПопробуйте позже ⌛️")
+            await update.message.reply_text(
+                "Вы можете запросить свежую подборку раз в 12 часов ⏰.\nПопробуйте позже ⌛️")
             return
 
     last_request_times[chat_id] = current_time
     animes = get_animes_from_shikimori()
 
     for anime in animes:
-        # Проверяем, что аниме не в статусе "анонс" и у него вышло хотя бы 1 эпизод
-        if anime.status == "anons" or anime.episode == 0:
-            continue
-
-        # Проверка на дублирование
-        if anime.id in episode_tracker and anime.episode <= episode_tracker[anime.id]:
-            continue  # Пропускаем уже отправленные эпизоды
-
-        episode_tracker[anime.id] = anime.episode
-        save_episode_tracker()
-
-        # Проверка наличия и корректности URL изображения
-        if anime.image:
-            try:
-                await context.bot.send_photo(chat_id, photo=anime.image, caption=anime.format_anime())
-            except Exception as e:
-                # Отправляем только текст, если что-то пошло не так с изображением
-                await context.bot.send_message(chat_id, text=anime.format_anime())
-                logger.error(f"Ошибка отправки изображения для аниме {anime.name}: {e}")
+        # Проверяем, подписан ли пользователь на это аниме
+        if anime.id in subscriptions.get(chat_id, {}):
+            button_text = "Отписаться"
         else:
-            # Если нет изображения, отправляем только текст
-            await context.bot.send_message(chat_id, text=anime.format_anime())
+            button_text = "Подписаться"
+
+        # Формируем кнопки с текстом "Подписаться" или "Отписаться"
+        keyboard = [[InlineKeyboardButton(button_text, callback_data=str(anime.id))]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Отправляем сообщение с информацией об аниме
+        await update.message.reply_photo(
+            photo=f"https://shikimori.one{anime.image['original']}",
+            caption=anime.format_anime(),
+            reply_markup=reply_markup
+        )
 
 
 # Получение текущего сезона
@@ -140,7 +114,7 @@ def get_current_season():
         12: "winter", 1: "winter", 2: "winter",
         3: "spring", 4: "spring", 5: "spring",
         6: "summer", 7: "summer", 8: "summer",
-        9: "fall", 10: "fall", 11: "fall"
+        9: "summer", 10: "fall", 11: "fall"
     }
     return f"{seasons[month]}_{year}"
 
@@ -164,14 +138,90 @@ def get_animes_from_shikimori():
         return []
 
 
+# Обработка нажатия кнопки подписки/отписки
+async def toggle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = str(query.message.chat.id)
+    anime_id = query.data
+
+    animes = get_animes_from_shikimori()
+    anime = next((a for a in animes if str(a.id) == anime_id), None)
+
+    if not anime:
+        await query.answer("Аниме не найдено.")
+        return
+
+    if chat_id not in subscriptions:
+        subscriptions[chat_id] = {}
+
+    if anime_id in subscriptions[chat_id]:
+        del subscriptions[chat_id][anime_id]
+        await query.answer(f"Вы отписались от аниме: {anime.title}.")
+    else:
+        subscriptions[chat_id][anime_id] = anime.episodes_aired  # Сохраняем текущее кол-во серий
+        await query.answer(f"Вы подписались на аниме: {anime.title}.")
+
+    save_subscriptions()
+
+    # Обновляем текст кнопки только если оно действительно изменилось
+    button_text = "Отписаться" if anime_id in subscriptions[chat_id] else "Подписаться"
+    keyboard = [[InlineKeyboardButton(button_text, callback_data=str(anime_id))]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Проверяем, изменились ли кнопки
+    if query.message.reply_markup.inline_keyboard[0][0].text != button_text:
+        await query.message.edit_reply_markup(reply_markup)
+
+# Проверка новых серий для подписанных аниме
+async def notify_new_episodes(context: ContextTypes.DEFAULT_TYPE):
+    animes = get_animes_from_shikimori()
+
+    for chat_id, subscribed_animes in subscriptions.items():
+        for anime in animes:
+            anime_id = str(anime.id)
+            if anime_id in subscribed_animes:
+                previous_episodes = subscribed_animes[anime_id]
+                if anime.episodes_aired > previous_episodes:
+                    # Обновляем кол-во серий и сохраняем подписки
+                    subscriptions[chat_id][anime_id] = anime.episodes_aired
+                    save_subscriptions()
+
+                    # Формируем сообщение с заголовком "Вышла новая серия"
+                    message_text = f"Вышла новая серия аниме:\n{anime.format_anime()}"
+
+                    # Кнопка подписки/отписки
+                    button_text = "Отписаться" if anime_id in subscriptions[chat_id] else "Подписаться"
+                    keyboard = [[InlineKeyboardButton(button_text, callback_data=str(anime_id))]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
+                    # Отправляем сообщение с картинкой и кнопками
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f"https://shikimori.one{anime.image['original']}",
+                        caption=message_text,
+                        reply_markup=reply_markup
+                    )
+                    logger.info(f"Уведомление отправлено для {anime.title} ({chat_id})")
+
 # Основная функция для запуска бота
 def main():
-    load_episode_tracker()
-    load_chat_ids()
+    load_subscriptions()
 
     application = ApplicationBuilder().token(API_TOKEN).build()
+
+    # Планировщик для проверки обновлений серий
+    scheduler = AsyncIOScheduler(timezone=utc)
+    scheduler.add_job(notify_new_episodes, 'interval', minutes=1, args=[application])  # проверяем раз в 30 минут
+    scheduler.start()
+
+    # Команды
     application.add_handler(CommandHandler("start", start))
+
+    # Сообщение о свежих аниме
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fresh_anime))
+
+    # Обработка нажатий на кнопки подписки/отписки
+    application.add_handler(CallbackQueryHandler(toggle_subscription))
 
     application.run_polling()
 
