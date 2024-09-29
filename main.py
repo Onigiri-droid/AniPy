@@ -3,10 +3,9 @@ import os
 import time
 import logging
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pytz import utc  # для работы с временными зонами
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -20,8 +19,7 @@ last_request_times = {}
 request_interval = 12 * 3600  # Интервал между запросами свежей подборки (12 часов)
 
 subscriptions_file = "subscriptions.json"
-API_TOKEN = '5160413773:AAGyjpQbrAL-1hR6bnV8GwDY3ioIjxBVRzk'  # Замените на ваш токен
-
+API_TOKEN = '7326786329:AAGV9rOHiBTJElNPzuImbcxchqJPdUksW18'  # Замените на ваш токен
 
 # Класс для хранения данных об аниме
 class Anime:
@@ -39,7 +37,6 @@ class Anime:
         episodes_all = str(self.episodes_all) if self.episodes_all > 0 else "?"
         return f"{title}\nРейтинг: {self.score} ⭐️\nСерии: {self.episodes_aired} из {episodes_all} 📺\nСсылка: https://shikimori.one/animes/{self.id}"
 
-
 # Загрузка подписок
 def load_subscriptions():
     global subscriptions
@@ -52,27 +49,30 @@ def load_subscriptions():
     else:
         subscriptions = {}
 
-
 # Сохранение подписок
 def save_subscriptions():
     with open(subscriptions_file, "w", encoding="utf-8") as file:
         json.dump(subscriptions, file, ensure_ascii=False, indent=4)
 
-
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat_id = str(update.message.chat.id)
     if chat_id not in subscriptions:
         subscriptions[chat_id] = {}
         save_subscriptions()
 
+    # Создаем клавиатуру с кнопкой "Свежая подборка"
+    keyboard = [
+        ["Свежая подборка"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    # Ответ на команду /start с клавиатурой
     await update.message.reply_text(
-        "Привет! Я бот, который сообщает о новинках аниме и позволяет подписаться на уведомления о выходе новых серий 📺 ✨"
+        "Привет! Я бот, который сообщает о новинках аниме и позволяет подписаться на уведомления о выходе новых серий 📺 ✨\n\nНажмите на кнопку 'Свежая подборка', чтобы посмотреть новые аниме.",
+        reply_markup=reply_markup
     )
 
-
-# Функция для получения свежих аниме
 # Функция для получения свежих аниме
 async def fresh_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat.id)
@@ -81,8 +81,7 @@ async def fresh_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка времени последнего запроса для предотвращения частого запроса
     if chat_id in last_request_times:
         if current_time - last_request_times[chat_id] < request_interval:
-            await update.message.reply_text(
-                "Вы можете запросить свежую подборку раз в 12 часов ⏰.\nПопробуйте позже ⌛️")
+            await update.message.reply_text("Вы можете запросить свежую подборку раз в 12 часов ⏰.\nПопробуйте позже ⌛️")
             return
 
     last_request_times[chat_id] = current_time
@@ -90,22 +89,14 @@ async def fresh_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for anime in animes:
         # Проверяем, подписан ли пользователь на это аниме
-        if anime.id in subscriptions.get(chat_id, {}):
+        if chat_id in subscriptions and str(anime.id) in subscriptions[chat_id]:
             button_text = "Отписаться"
         else:
             button_text = "Подписаться"
 
-        # Формируем кнопки с текстом "Подписаться" или "Отписаться"
         keyboard = [[InlineKeyboardButton(button_text, callback_data=str(anime.id))]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Отправляем сообщение с информацией об аниме
-        await update.message.reply_photo(
-            photo=f"https://shikimori.one{anime.image['original']}",
-            caption=anime.format_anime(),
-            reply_markup=reply_markup
-        )
-
+        await update.message.reply_photo(photo=f"https://shikimori.one{anime.image['original']}", caption=anime.format_anime(), reply_markup=reply_markup)
 
 # Получение текущего сезона
 def get_current_season():
@@ -114,10 +105,9 @@ def get_current_season():
         12: "winter", 1: "winter", 2: "winter",
         3: "spring", 4: "spring", 5: "spring",
         6: "summer", 7: "summer", 8: "summer",
-        9: "summer", 10: "fall", 11: "fall"
+        9: "fall", 10: "fall", 11: "fall"
     }
     return f"{seasons[month]}_{year}"
-
 
 # Получение аниме с Shikimori API
 def get_animes_from_shikimori():
@@ -136,7 +126,6 @@ def get_animes_from_shikimori():
     except requests.RequestException as e:
         logger.error(f"Не удалось получить аниме: {e}")
         return []
-
 
 # Обработка нажатия кнопки подписки/отписки
 async def toggle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,25 +171,11 @@ async def notify_new_episodes(context: ContextTypes.DEFAULT_TYPE):
             if anime_id in subscribed_animes:
                 previous_episodes = subscribed_animes[anime_id]
                 if anime.episodes_aired > previous_episodes:
-                    # Обновляем кол-во серий и сохраняем подписки
+                    # Обновляем кол-во серий и уведомляем пользователя
                     subscriptions[chat_id][anime_id] = anime.episodes_aired
                     save_subscriptions()
 
-                    # Формируем сообщение с заголовком "Вышла новая серия"
-                    message_text = f"Вышла новая серия аниме:\n{anime.format_anime()}"
-
-                    # Кнопка подписки/отписки
-                    button_text = "Отписаться" if anime_id in subscriptions[chat_id] else "Подписаться"
-                    keyboard = [[InlineKeyboardButton(button_text, callback_data=str(anime_id))]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-
-                    # Отправляем сообщение с картинкой и кнопками
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=f"https://shikimori.one{anime.image['original']}",
-                        caption=message_text,
-                        reply_markup=reply_markup
-                    )
+                    await context.bot.send_message(chat_id, text=f"Вышла новая серия аниме: {anime.title}\nСерии: {anime.episodes_aired}")
                     logger.info(f"Уведомление отправлено для {anime.title} ({chat_id})")
 
 # Основная функция для запуска бота
@@ -209,22 +184,17 @@ def main():
 
     application = ApplicationBuilder().token(API_TOKEN).build()
 
-    # Планировщик для проверки обновлений серий
-    scheduler = AsyncIOScheduler(timezone=utc)
-    scheduler.add_job(notify_new_episodes, 'interval', minutes=1, args=[application])  # проверяем раз в 30 минут
-    scheduler.start()
-
     # Команды
     application.add_handler(CommandHandler("start", start))
 
     # Сообщение о свежих аниме
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fresh_anime))
+    application.add_handler(MessageHandler(filters.TEXT & (filters.Regex("Свежая подборка")), fresh_anime))
 
     # Обработка нажатий на кнопки подписки/отписки
     application.add_handler(CallbackQueryHandler(toggle_subscription))
 
+    # Запускаем бота
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
